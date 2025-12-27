@@ -12,9 +12,9 @@ import os
    
 AWS_REGION = "us-east-1"                      
 
-BRONZE_BUCKET = "bucket05-bronze"
-SILVER_BUCKET = "bucket05-silver"
-GOLD_BUCKET = "bucket05-gold"
+BRONZE_BUCKET = "bucket1"
+SILVER_BUCKET = "bucket2"
+GOLD_BUCKET = "bucket3"
 
 PDF_KEY = "prescription.pdf"
 BRONZE_CSV_KEY = "bronze/output_raw.csv"
