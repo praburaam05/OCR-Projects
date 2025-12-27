@@ -1,0 +1,142 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+import boto3
+import pandas as pd
+import pytesseract
+from pdf2image import convert_from_path
+import io
+import os
+
+   # Then you define AWS region and S3 bucket names
+   
+AWS_REGION = "us-east-1"                      
+
+BRONZE_BUCKET = "bucket05-bronze"
+SILVER_BUCKET = "bucket05-silver"
+GOLD_BUCKET = "bucket05-gold"
+
+PDF_KEY = "prescription.pdf"
+BRONZE_CSV_KEY = "bronze/output_raw.csv"
+SILVER_CSV_KEY = "silver/output_clean.csv"
+GOLD_CSV_KEY = "gold/output_final.csv"
+
+s3 = boto3.client("s3", region_name=AWS_REGION)      #This allows reading/writing files to S3.
+
+# ------------------------------------------------------
+# 1) PDF → Images → OCR Text → Bronze CSV
+# ------------------------------------------------------
+   #Read the PDF → convert each page to image → extract text using OCR → store raw text in Bronze S3 bucket.
+   def pdf_to_bronze():
+
+    # Download the PDF
+    pdf_obj = s3.get_object(Bucket=BRONZE_BUCKET, Key=PDF_KEY)
+    pdf_path = "/tmp/input.pdf"                                       #Airflow tasks run inside isolated environment, so use /tmp.
+    with open(pdf_path, "wb") as f:
+        f.write(pdf_obj["Body"].read())
+
+    # Convert PDF → images → OCR
+    images = convert_from_path(pdf_path, dpi=300)               #DPI  ==> Dots Per Inch (dpi = 300 to 400 best)
+    text_output = ""
+
+    for page in images:
+        text_output += pytesseract.image_to_string(page)
+
+    # Convert OCR lines into CSV rows
+    rows = text_output.split("\n")
+    df = pd.DataFrame(rows, columns=["raw_text"])
+
+    # Upload Bronze CSV
+    csv_buffer = io.StringIO()                            #When you want to upload a CSV to S3, AWS expects a string (text) object, not a file on disk.
+    df.to_csv(csv_buffer, index=False)
+
+    s3.put_object(
+        Bucket=BRONZE_BUCKET,
+        Key=BRONZE_CSV_KEY,
+		    Body=csv_buffer.getvalue()
+    )
+
+
+# ------------------------------------------------------
+# 2) Bronze → Silver (Clean Text)
+# ------------------------------------------------------
+def bronze_to_silver():
+
+    obj = s3.get_object(Bucket=BRONZE_BUCKET, Key=BRONZE_CSV_KEY)
+    df = pd.read_csv(io.BytesIO(obj["Body"].read()))
+
+    df["raw_text"] = df["raw_text"].astype(str).fillna("")
+
+    # Clean text
+    df["clean_text"] = (
+        df["raw_text"]
+        .str.replace(r"[^A-Za-z0-9 ]", "", regex=True)
+        .str.strip()
+    )
+
+    # Remove empty rows
+    df = df[df["clean_text"] != ""]
+
+    # Upload Silver CSV
+    csv_buffer = io.StringIO()
+	 df.to_csv(csv_buffer, index=False)
+
+    s3.put_object(
+        Bucket=SILVER_BUCKET,
+        Key=SILVER_CSV_KEY,
+        Body=csv_buffer.getvalue()
+    )
+
+
+# ------------------------------------------------------
+# 3) Silver → Gold (Add Features)
+# ------------------------------------------------------
+def silver_to_gold():
+
+    obj = s3.get_object(Bucket=SILVER_BUCKET, Key=SILVER_CSV_KEY)
+    df = pd.read_csv(io.BytesIO(obj["Body"].read()))
+
+    # Fix NaN values before split()
+    df["clean_text"] = df["clean_text"].fillna("")
+
+    # Add word count
+    df["word_count"] = df["clean_text"].apply(lambda x: len(str(x).split()))
+
+    # Upload Gold CSV
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+	  s3.put_object(
+        Bucket=GOLD_BUCKET,
+        Key=GOLD_CSV_KEY,
+        Body=csv_buffer.getvalue()
+    )
+
+
+# ------------------------------------------------------
+# DAG Definition
+# ------------------------------------------------------
+with DAG(
+    dag_id="pdf_to_gold_etl_pipeline",
+    start_date=datetime(2025, 1, 1),
+    schedule_interval="0 2 * * *",  # Run daily at 2 AM
+    catchup=False
+) as dag:
+
+    bronze_task = PythonOperator(
+        task_id="pdf_to_bronze",
+        python_callable=pdf_to_bronze
+    )
+
+    silver_task = PythonOperator(
+        task_id="bronze_to_silver",
+        python_callable=bronze_to_silver
+    )
+	
+    gold_task = PythonOperator(
+        task_id="silver_to_gold",
+        python_callable=silver_to_gold
+    )
+
+    bronze_task >> silver_task >> gold_task               #Task dependencies
+
+
